@@ -335,6 +335,10 @@ mesh:
   # TX; the packet is logged with drop reason
   # "Redundant flood retransmission (rebroadcast heard)" instead of being sent.
   # Reduces redundant airtime and collisions on busy networks.
+  # Only copies whose path actually grew (another repeater appended its path
+  # hash) count as rebroadcasts. Same-depth copies — e.g. the origin resending
+  # the same packet — are ignored so normal path flooding (our TX appending our
+  # hash to the path) is never cancelled without evidence of propagation.
   flood_suppression_enabled: false
 
   # Rebroadcast copies heard (while our TX is pending) that trigger suppression.

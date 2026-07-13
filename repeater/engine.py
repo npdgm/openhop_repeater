@@ -574,7 +574,9 @@ class RepeaterHandler(BaseHandler):
             self.recv_flood_count += 1
             self.flood_dup_count += 1
             # Rebroadcast copy heard — may cancel our own pending flood TX.
-            self._note_flood_duplicate(pkt_hash_full)
+            # Pass the copy's hop count so same-depth copies (no path growth)
+            # are not mistaken for rebroadcasts.
+            self._note_flood_duplicate(pkt_hash_full, hop_count=self._safe_hop_count(packet))
         elif route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
             self.recv_direct_count += 1
             self.direct_dup_count += 1
@@ -812,17 +814,47 @@ class RepeaterHandler(BaseHandler):
             threshold = 1
         self.flood_suppression_threshold = max(1, threshold)
 
-    def _note_flood_duplicate(self, pkt_hash: Optional[str]) -> None:
+    @staticmethod
+    def _safe_hop_count(packet: Packet) -> Optional[int]:
+        """Return the packet's path hop count, or None when it cannot be read."""
+        try:
+            return packet.get_path_hash_count()
+        except Exception:
+            return None
+
+    def _note_flood_duplicate(
+        self, pkt_hash: Optional[str], hop_count: Optional[int] = None
+    ) -> None:
         """Count a rebroadcast copy heard while our own flood TX is pending.
 
         Redundant flood retransmission check: once the configured number of
         rebroadcast copies has been heard, the pending retransmission is
         cancelled before it reaches the radio.
+
+        The packet hash covers only payload type + payload (path excluded), so
+        every copy of a flood packet matches regardless of hop depth — including
+        the origin resending the same packet. Only copies whose path actually
+        grew (hop_count >= the depth of our own forwarded copy) prove another
+        repeater relayed the packet and appended its path hash. Same-depth
+        copies (e.g. the origin's retry with an empty path) are ignored so
+        normal path flooding — which relies on our TX adding our hash to the
+        path — is not cancelled without evidence of propagation.
         """
         if not self.flood_suppression_enabled or not pkt_hash:
             return
         entry = self._pending_flood_tx.get(pkt_hash)
         if entry is None or entry["cancel_event"].is_set():
+            return
+        min_hops = entry.get("min_hops")
+        if min_hops is not None and hop_count is not None and hop_count < min_hops:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Flood suppression: ignoring same-depth copy of packet %s "
+                    "(hops=%d < %d) — not a rebroadcast",
+                    pkt_hash[:16],
+                    hop_count,
+                    min_hops,
+                )
             return
         entry["dup_count"] += 1
         if entry["dup_count"] >= self.flood_suppression_threshold:
@@ -1014,8 +1046,12 @@ class RepeaterHandler(BaseHandler):
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
             # Rebroadcast copy heard (dispatcher dedupe disabled path) — may
-            # cancel our own pending flood TX for this packet.
-            self._note_flood_duplicate(packet_hash or packet.calculate_packet_hash().hex().upper())
+            # cancel our own pending flood TX for this packet. Hop count guards
+            # against same-depth copies (no path growth) triggering suppression.
+            self._note_flood_duplicate(
+                packet_hash or packet.calculate_packet_hash().hex().upper(),
+                hop_count=self._safe_hop_count(packet),
+            )
             packet.drop_reason = "Duplicate"
             return None
 
@@ -1223,7 +1259,15 @@ class RepeaterHandler(BaseHandler):
         """
         suppression_entry = None
         if suppressible and self.flood_suppression_enabled and packet_hash:
-            suppression_entry = {"cancel_event": asyncio.Event(), "dup_count": 0}
+            # min_hops = depth of our forwarded copy (original + our appended
+            # hash). Only duplicate copies at this depth or deeper prove another
+            # repeater relayed the packet (the packet hash excludes the path, so
+            # the origin's own retry would otherwise match and cancel our TX).
+            suppression_entry = {
+                "cancel_event": asyncio.Event(),
+                "dup_count": 0,
+                "min_hops": self._safe_hop_count(fwd_pkt),
+            }
             self._pending_flood_tx[packet_hash] = suppression_entry
 
         def _suppression_triggered() -> bool:
