@@ -43,6 +43,11 @@ LOOP_DETECT_MAX_COUNTERS = {
     LOOP_DETECT_STRICT: 1,
 }
 
+# Sentinel returned by schedule_retransmit's task when a pending flood TX was
+# cancelled by the redundant flood retransmission check (rebroadcasts of the
+# same packet were heard before our own TX slot fired).
+TX_RESULT_SUPPRESSED = "suppressed"
+
 
 class RepeaterHandler(BaseHandler):
     @staticmethod
@@ -85,6 +90,10 @@ class RepeaterHandler(BaseHandler):
         self.loop_detect_mode = self._normalize_loop_detect_mode(
             config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
         )
+        # Redundant flood retransmission suppression (rebroadcast cancellation).
+        self._load_flood_suppression_config()
+        # pkt_hash (full upper hex) -> {"cancel_event": asyncio.Event, "dup_count": int}
+        self._pending_flood_tx = {}
 
         radio = dispatcher.radio if dispatcher else None
         if radio:
@@ -118,6 +127,7 @@ class RepeaterHandler(BaseHandler):
         self.sent_direct_count = 0
         self.flood_dup_count = 0
         self.direct_dup_count = 0
+        self.flood_suppressed_count = 0
 
         # Storage collector for persistent packet logging
         try:
@@ -238,6 +248,7 @@ class RepeaterHandler(BaseHandler):
         snr = metadata.get("snr", 0.0)
         rssi = metadata.get("rssi", 0)
         transmitted = False
+        tx_suppressed = False
         tx_delay_ms = 0.0
         drop_reason = None
         lbt_attempts = 0
@@ -330,8 +341,17 @@ class RepeaterHandler(BaseHandler):
                     self.dropped_count += 1
                     drop_reason = "Duty cycle limit"
             else:
+                suppressible = not local_transmission and route_type in (
+                    ROUTE_TYPE_FLOOD,
+                    ROUTE_TYPE_TRANSPORT_FLOOD,
+                )
                 tx_task = await self.schedule_retransmit(
-                    fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
+                    fwd_pkt,
+                    delay,
+                    airtime_ms,
+                    local_transmission=local_transmission,
+                    packet_hash=pkt_hash_full,
+                    suppressible=suppressible,
                 )
                 try:
                     tx_success = await tx_task
@@ -340,7 +360,13 @@ class RepeaterHandler(BaseHandler):
                     drop_reason = "TX failed"
                     logger.warning(f"Local TX failed: {e}")
                     raise
-                if not tx_success:
+                if tx_success == TX_RESULT_SUPPRESSED:
+                    transmitted = False
+                    tx_suppressed = True
+                    drop_reason = "Redundant flood retransmission (rebroadcast heard)"
+                    self.flood_suppressed_count += 1
+                    self.dropped_count += 1
+                elif not tx_success:
                     transmitted = False
                     drop_reason = "TX failed"
                     self.dropped_count += 1
@@ -388,8 +414,8 @@ class RepeaterHandler(BaseHandler):
                     f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
                 )
 
-        # Check if this is a duplicate
-        is_dupe = pkt_hash_full in self.seen_packets and not transmitted
+        # Check if this is a duplicate (a suppressed TX is not a duplicate of itself)
+        is_dupe = pkt_hash_full in self.seen_packets and not transmitted and not tx_suppressed
 
         # Set drop reason for duplicates and count flood vs direct dups
         if is_dupe and drop_reason is None:
@@ -543,9 +569,12 @@ class RepeaterHandler(BaseHandler):
         """
         self.rx_count += 1
         route_type = packet.header & PH_ROUTE_MASK
+        pkt_hash_full = packet.calculate_packet_hash().hex().upper()
         if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
             self.recv_flood_count += 1
             self.flood_dup_count += 1
+            # Rebroadcast copy heard — may cancel our own pending flood TX.
+            self._note_flood_duplicate(pkt_hash_full)
         elif route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
             self.recv_direct_count += 1
             self.direct_dup_count += 1
@@ -573,7 +602,7 @@ class RepeaterHandler(BaseHandler):
             transmitted=False,
             drop_reason="Duplicate",
             is_duplicate=True,
-            packet_hash=packet.calculate_packet_hash().hex().upper(),
+            packet_hash=pkt_hash_full,
         )
 
         if self.storage:
@@ -773,6 +802,38 @@ class RepeaterHandler(BaseHandler):
         if len(self.seen_packets) > self.max_cache_size:
             self.seen_packets.popitem(last=False)
 
+    def _load_flood_suppression_config(self) -> None:
+        """Load redundant-flood-retransmission suppression settings from config."""
+        mesh_cfg = self.config.get("mesh", {})
+        self.flood_suppression_enabled = bool(mesh_cfg.get("flood_suppression_enabled", False))
+        try:
+            threshold = int(mesh_cfg.get("flood_suppression_threshold", 1))
+        except (TypeError, ValueError):
+            threshold = 1
+        self.flood_suppression_threshold = max(1, threshold)
+
+    def _note_flood_duplicate(self, pkt_hash: Optional[str]) -> None:
+        """Count a rebroadcast copy heard while our own flood TX is pending.
+
+        Redundant flood retransmission check: once the configured number of
+        rebroadcast copies has been heard, the pending retransmission is
+        cancelled before it reaches the radio.
+        """
+        if not self.flood_suppression_enabled or not pkt_hash:
+            return
+        entry = self._pending_flood_tx.get(pkt_hash)
+        if entry is None or entry["cancel_event"].is_set():
+            return
+        entry["dup_count"] += 1
+        if entry["dup_count"] >= self.flood_suppression_threshold:
+            entry["cancel_event"].set()
+            logger.info(
+                "Redundant flood retransmission check: heard %d rebroadcast(s) of "
+                "packet %s — cancelling our pending TX",
+                entry["dup_count"],
+                pkt_hash[:16],
+            )
+
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
         if not packet or not packet.payload:
@@ -952,6 +1013,9 @@ class RepeaterHandler(BaseHandler):
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
+            # Rebroadcast copy heard (dispatcher dedupe disabled path) — may
+            # cancel our own pending flood TX for this packet.
+            self._note_flood_duplicate(packet_hash or packet.calculate_packet_hash().hex().upper())
             packet.drop_reason = "Duplicate"
             return None
 
@@ -1143,77 +1207,123 @@ class RepeaterHandler(BaseHandler):
         delay: float,
         airtime_ms: float = 0.0,
         local_transmission: bool = False,
+        packet_hash: Optional[str] = None,
+        suppressible: bool = False,
     ):
         """Schedule a packet retransmission with delay and return the task.
 
         If local_transmission is True and the first send fails, retry once after
         a short delay (handles transient radio/LBT failures).
+
+        When suppressible is True (relayed flood packets) and flood suppression
+        is enabled, the pending TX is registered under packet_hash so that
+        rebroadcast copies heard during the delay cancel it (redundant flood
+        retransmission check). The task then resolves to TX_RESULT_SUPPRESSED
+        instead of True/False.
         """
+        suppression_entry = None
+        if suppressible and self.flood_suppression_enabled and packet_hash:
+            suppression_entry = {"cancel_event": asyncio.Event(), "dup_count": 0}
+            self._pending_flood_tx[packet_hash] = suppression_entry
+
+        def _suppression_triggered() -> bool:
+            return suppression_entry is not None and suppression_entry["cancel_event"].is_set()
+
+        def _log_suppressed(stage: str) -> None:
+            logger.info(
+                "TX prevented (%s): redundant flood retransmission check — "
+                "%d rebroadcast(s) of packet %s heard while TX was pending",
+                stage,
+                suppression_entry["dup_count"],
+                (packet_hash or "")[:16],
+            )
 
         async def delayed_send():
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.sleep(delay)
 
-            # Each attempt gets its own lock acquisition so the 1-second retry
-            # backoff (local_transmission only) happens OUTSIDE the lock.
-            # Holding _tx_lock across asyncio.sleep(1.0) would block every other
-            # queued TX task for the full backoff period.
-            #
-            # Loop runs once for relayed packets, twice for local_transmission:
-            #   attempt 0 — initial try (no pre-sleep)
-            #   attempt 1 — retry after 1s backoff outside the lock
-            for attempt in range(2 if local_transmission else 1):
-                if attempt > 0:
-                    # Back-off OUTSIDE the lock — other tasks can transmit here.
-                    logger.info("Retrying local TX in 1s (lock released during backoff)...")
-                    await asyncio.sleep(1.0)
+                # Redundant flood retransmission check — rebroadcasts may have
+                # arrived while this task slept through its collision-avoidance
+                # delay. Skip the radio entirely if the packet is already covered.
+                if _suppression_triggered():
+                    _log_suppressed("pre-send")
+                    return TX_RESULT_SUPPRESSED
 
-                async with self._tx_lock:
-                    # ── Authoritative duty-cycle gate ──────────────────────────
-                    # The upfront can_transmit() call in __call__ is advisory: it
-                    # avoids scheduling packets obviously over budget, but cannot
-                    # prevent a race between tasks whose delay timers expire nearly
-                    # simultaneously.  Both pass the advisory check before either
-                    # records airtime, then both attempt to transmit.
-                    #
-                    # Inside _tx_lock only one task runs at a time.  The check and
-                    # record_tx() are effectively atomic — no TOCTOU window.
-                    # Re-checked every attempt because airtime state may change
-                    # while we wait for the lock or sleep through backoff.
-                    if airtime_ms > 0:
-                        can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
-                        if not can_tx_now:
-                            logger.warning(
-                                "Packet dropped at TX time: duty-cycle exceeded (airtime=%.1fms)",
-                                airtime_ms,
-                            )
-                            return False
+                # Each attempt gets its own lock acquisition so the 1-second retry
+                # backoff (local_transmission only) happens OUTSIDE the lock.
+                # Holding _tx_lock across asyncio.sleep(1.0) would block every other
+                # queued TX task for the full backoff period.
+                #
+                # Loop runs once for relayed packets, twice for local_transmission:
+                #   attempt 0 — initial try (no pre-sleep)
+                #   attempt 1 — retry after 1s backoff outside the lock
+                for attempt in range(2 if local_transmission else 1):
+                    if attempt > 0:
+                        # Back-off OUTSIDE the lock — other tasks can transmit here.
+                        logger.info("Retrying local TX in 1s (lock released during backoff)...")
+                        await asyncio.sleep(1.0)
 
-                    try:
-                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
-                        if not sent:
-                            logger.warning(
-                                "Retransmit failed (attempt %d): dispatcher returned false",
-                                attempt + 1,
-                            )
-                            if local_transmission and attempt == 0:
-                                continue
-                            return False
-                        self._record_packet_sent(fwd_pkt)
+                    async with self._tx_lock:
+                        # Re-check after acquiring the lock: rebroadcasts may have
+                        # arrived while another task held the radio.
+                        if _suppression_triggered():
+                            _log_suppressed("at-lock")
+                            return TX_RESULT_SUPPRESSED
+
+                        # ── Authoritative duty-cycle gate ──────────────────────────
+                        # The upfront can_transmit() call in __call__ is advisory: it
+                        # avoids scheduling packets obviously over budget, but cannot
+                        # prevent a race between tasks whose delay timers expire nearly
+                        # simultaneously.  Both pass the advisory check before either
+                        # records airtime, then both attempt to transmit.
+                        #
+                        # Inside _tx_lock only one task runs at a time.  The check and
+                        # record_tx() are effectively atomic — no TOCTOU window.
+                        # Re-checked every attempt because airtime state may change
+                        # while we wait for the lock or sleep through backoff.
                         if airtime_ms > 0:
-                            self.airtime_mgr.record_tx(airtime_ms)
-                        packet_size = fwd_pkt.get_raw_length()
-                        logger.info(
-                            f"Retransmitted packet ({packet_size} bytes, "
-                            f"{airtime_ms:.1f}ms airtime)"
-                        )
-                        return True
-                    except Exception as e:
-                        logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
-                        if local_transmission and attempt == 0:
-                            pass  # release lock, outer loop sleeps, then retries
-                        else:
-                            raise
-            return False
+                            can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
+                            if not can_tx_now:
+                                logger.warning(
+                                    "Packet dropped at TX time: duty-cycle exceeded (airtime=%.1fms)",
+                                    airtime_ms,
+                                )
+                                return False
+
+                        try:
+                            sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                            if not sent:
+                                logger.warning(
+                                    "Retransmit failed (attempt %d): dispatcher returned false",
+                                    attempt + 1,
+                                )
+                                if local_transmission and attempt == 0:
+                                    continue
+                                return False
+                            self._record_packet_sent(fwd_pkt)
+                            if airtime_ms > 0:
+                                self.airtime_mgr.record_tx(airtime_ms)
+                            packet_size = fwd_pkt.get_raw_length()
+                            logger.info(
+                                f"Retransmitted packet ({packet_size} bytes, "
+                                f"{airtime_ms:.1f}ms airtime)"
+                            )
+                            return True
+                        except Exception as e:
+                            logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
+                            if local_transmission and attempt == 0:
+                                pass  # release lock, outer loop sleeps, then retries
+                            else:
+                                raise
+                return False
+            finally:
+                # Deregister the pending TX regardless of outcome so the registry
+                # never grows beyond in-flight retransmissions.
+                if (
+                    suppression_entry is not None
+                    and self._pending_flood_tx.get(packet_hash) is suppression_entry
+                ):
+                    self._pending_flood_tx.pop(packet_hash, None)
 
         return asyncio.create_task(delayed_send())
 
@@ -1287,6 +1397,7 @@ class RepeaterHandler(BaseHandler):
             "sent_direct_count": self.sent_direct_count,
             "flood_dup_count": self.flood_dup_count,
             "direct_dup_count": self.direct_dup_count,
+            "flood_suppressed_count": self.flood_suppressed_count,
             "rx_per_hour": rx_per_hour,
             "forwarded_per_hour": forwarded_per_hour,
             "recent_packets": list(self.recent_packets),
@@ -1332,6 +1443,8 @@ class RepeaterHandler(BaseHandler):
                         self.config.get("mesh", {}).get("global_flood_allow", True),
                     ),
                     "path_hash_mode": self.config.get("mesh", {}).get("path_hash_mode", 0),
+                    "flood_suppression_enabled": self.flood_suppression_enabled,
+                    "flood_suppression_threshold": self.flood_suppression_threshold,
                 },
                 "mqtt_brokers": self.config.get("mqtt_brokers", {}),
             },
@@ -1465,6 +1578,7 @@ class RepeaterHandler(BaseHandler):
             self.loop_detect_mode = self._normalize_loop_detect_mode(
                 self.config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
             )
+            self._load_flood_suppression_config()
 
             # Note: Radio config changes require restart as they affect hardware
             # Note: Airtime manager has its own config reference that gets updated

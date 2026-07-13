@@ -328,6 +328,20 @@ mesh:
   # Use null or "<null>" via CLI command "region default <null>" to clear.
   default_region: null
 
+  # Redundant flood retransmission suppression (rebroadcast cancellation).
+  # While our own flood retransmission waits out its collision-avoidance delay,
+  # other repeaters often rebroadcast the same packet first. When enabled,
+  # hearing flood_suppression_threshold rebroadcast copies cancels our pending
+  # TX; the packet is logged with drop reason
+  # "Redundant flood retransmission (rebroadcast heard)" instead of being sent.
+  # Reduces redundant airtime and collisions on busy networks.
+  flood_suppression_enabled: false
+
+  # Rebroadcast copies heard (while our TX is pending) that trigger suppression.
+  # Minimum 1. Raise to 2+ if your repeater provides critical coverage and you
+  # only want to skip TX when the packet is clearly well-propagated.
+  flood_suppression_threshold: 1
+
 # Multiple Identity Configuration (Optional)
 # Define additional identities for the repeater to manage
 # Each identity operates independently with its own key pair and configuration
