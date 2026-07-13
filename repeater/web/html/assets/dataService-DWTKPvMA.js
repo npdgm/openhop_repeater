@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DDCfvMzz.js";export{e as useDataService};
