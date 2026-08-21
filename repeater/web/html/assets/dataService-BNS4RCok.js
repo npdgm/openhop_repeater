@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DEGRHKWi.js";export{e as useDataService};
